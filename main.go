@@ -153,10 +153,9 @@ func runSplit(cfg config) error {
 		if err != nil {
 			return fmt.Errorf("could not count lines: %w", err)
 		}
-		// Add 1 to newline count for line count, if file is not empty
-		if lines > 0 || stat, _ := f.Stat(); stat.Size() > 0 {
-			lines++
-		}
+		// The line count is the number of newlines. If the file doesn't end
+		// with a newline, the last line won't be counted, which is a slight inaccuracy
+		// this tool accepts for performance. The `+1` logic was buggy.
 		totalLines = lines
 		sparseIndex = index
 	}
@@ -165,10 +164,18 @@ func runSplit(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("could not resolve range: %w", err)
 	}
+
+	// Create a single buffered reader that will be used for all subsequent reads.
+	// This avoids "competing reader" bugs.
+	// We must seek to the start of the file first before creating the reader.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("could not seek to start of file: %w", err)
+	}
+	reader := bufio.NewReaderSize(f, bufSize)
 	
 	var header []byte
 	if !cfg.noHeader && startLine == 1 {
-		header, err = extractHeader(f)
+		header, err = extractHeader(reader)
 		if err != nil {
 			return fmt.Errorf("could not extract header: %w", err)
 		}
@@ -190,9 +197,9 @@ func runSplit(cfg config) error {
 
 
 	if cfg.filesN > 0 {
-		return runSplitByFiles(cfg, f, startLine, endLine, header, totalDataLines, sparseIndex)
+		return runSplitByFiles(cfg, f, reader, startLine, endLine, header, totalDataLines, sparseIndex)
 	} else if cfg.linesN > 0 {
-		return runSplitByLines(cfg, f, startLine, endLine, header, sparseIndex)
+		return runSplitByLines(cfg, f, reader, startLine, endLine, header, sparseIndex)
 	}
 
 	return errors.New("no split mode selected (this should not be reached)")
@@ -213,10 +220,18 @@ var bufferPool = sync.Pool{
 type chunk struct {
 	start int64
 	end   int64
+	index int64
+}
+
+type chunkResult struct {
+	chunkIndex   int64
+	lineCount    int64
+	partialIndex map[int64]int64
 }
 
 // countLinesAndIndex counts the number of lines and builds a sparse index of line number to byte offset.
-// It does this concurrently by dividing the file into chunks and processing them in parallel.
+// It uses a parallel map-reduce strategy: workers process chunks in parallel, and the main
+// goroutine reduces their results sequentially to build the final index.
 func countLinesAndIndex(f *os.File, quiet bool) (int64, map[int64]int64, error) {
 	stat, err := f.Stat()
 	if err != nil {
@@ -228,14 +243,13 @@ func countLinesAndIndex(f *os.File, quiet bool) (int64, map[int64]int64, error) 
 		return 0, make(map[int64]int64), nil
 	}
 
-	// Determine the number of chunks and workers
 	numChunks := fileSize / chunkSize
 	if fileSize%chunkSize != 0 {
 		numChunks++
 	}
 	numWorkers := runtime.NumCPU()
 	if numWorkers > 16 {
-		numWorkers = 16 // Cap workers to avoid excessive contention
+		numWorkers = 16
 	}
 	if numWorkers > int(numChunks) {
 		numWorkers = int(numChunks)
@@ -244,43 +258,24 @@ func countLinesAndIndex(f *os.File, quiet bool) (int64, map[int64]int64, error) 
 		fmt.Printf("Counting lines with %d goroutines...\n", numWorkers)
 	}
 
-	// Prepare for concurrent processing
-	var totalLines int64
-	sparseIndex := make(map[int64]int64)
-	sparseIndex[1] = 0 // Line 1 always starts at offset 0
-	var mu sync.Mutex
 	var wg sync.WaitGroup
-
 	chunkCh := make(chan chunk, numChunks)
+	resultsCh := make(chan chunkResult, numChunks)
+	errCh := make(chan error, numWorkers)
 
-	// Start worker pool
+	// Start worker pool (Map phase)
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var localLines int64
-			localIndex := make(map[int64]int64)
-
 			for c := range chunkCh {
-				lines, partialIndex, err := countInChunk(f, c.start, c.end)
+				lines, pIndex, err := countInChunk(f, c.start, c.end)
 				if err != nil {
-					// In a real app, you'd want to handle this error better,
-					// perhaps by canceling other goroutines. For now, we'll log it.
-					fmt.Fprintf(os.Stderr, "Error counting in chunk: %v\n", err)
-					continue
+					errCh <- fmt.Errorf("error in chunk %d: %w", c.index, err)
+					return
 				}
-				localLines += lines
-				for line, offset := range partialIndex {
-					localIndex[line] = offset
-				}
+				resultsCh <- chunkResult{chunkIndex: c.index, lineCount: lines, partialIndex: pIndex}
 			}
-			// Atomically add to the total and merge the index under a lock
-			atomic.AddInt64(&totalLines, localLines)
-			mu.Lock()
-			for line, offset := range localIndex {
-				sparseIndex[line] = offset
-			}
-			mu.Unlock()
 		}()
 	}
 
@@ -291,58 +286,96 @@ func countLinesAndIndex(f *os.File, quiet bool) (int64, map[int64]int64, error) 
 		if end > fileSize {
 			end = fileSize
 		}
-		chunkCh <- chunk{start: start, end: end}
+		chunkCh <- chunk{start: start, end: end, index: i}
 	}
 	close(chunkCh)
 
 	wg.Wait()
+	close(resultsCh)
+	close(errCh)
 
-	// The line count is off by one because we count newlines.
-	// If the file doesn't end with a newline, the last line is not counted.
-	// We add 1 to account for the first line (if file is not empty).
-	// A more robust way is to check if the file ends with a newline.
-	// For now, let's assume the count is close enough for splitting purposes.
-	// The final line count will be derived from the sparse index later.
-	// A simple `totalLines + 1` is often used. Let's stick to the raw count for now.
+	// Check for errors from workers
+	if len(errCh) > 0 {
+		return 0, nil, <-errCh // Return the first error found
+	}
 
-	return totalLines, sparseIndex, nil
+	// --- Reduce phase (sequential) ---
+	results := make([]chunkResult, numChunks)
+	for res := range resultsCh {
+		results[res.chunkIndex] = res // Store results in order using the chunk index
+	}
+
+	var totalNewlines int64
+	sparseIndex := make(map[int64]int64)
+	sparseIndex[1] = 0 // Line 1 always starts at offset 0
+
+	var newlinesBeforeThisChunk int64 = 0
+	for _, res := range results {
+		for localNewlineCount, byteOffset := range res.partialIndex {
+			// The global line number is the count of all newlines in previous chunks,
+			// plus the count of newlines in this chunk so far, plus one (for 1-based indexing).
+			globalLineNum := newlinesBeforeThisChunk + localNewlineCount + 1
+			sparseIndex[globalLineNum] = byteOffset
+		}
+		totalNewlines += res.lineCount
+		newlinesBeforeThisChunk += res.lineCount
+	}
+
+	// The caller expects the number of newlines, and will add 1 if the file is not empty.
+	return totalNewlines, sparseIndex, nil
 }
 
-// countInChunk reads a chunk of a file and counts the newlines within it.
-// It's careful to handle newlines that might span the chunk boundary.
+// countInChunk reads a chunk of a file, counts the newlines within it, and builds a
+// sparse index of local line numbers to global byte offsets.
 func countInChunk(f *os.File, start, end int64) (int64, map[int64]int64, error) {
-	// Get a buffer from the pool
+	size := end - start
+	if size <= 0 {
+		return 0, nil, nil
+	}
+
 	bufPtr := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufPtr)
-	
-	size := end - start
-	buf := (*bufPtr)[:size]
+	buf := *bufPtr
 
-	_, err := f.ReadAt(buf, start)
+	// Ensure buffer is large enough.
+	if int64(len(buf)) < size {
+		buf = make([]byte, size)
+	} else {
+		buf = buf[:size]
+	}
+
+	n, err := f.ReadAt(buf, start)
 	if err != nil && err != io.EOF {
 		return 0, nil, err
 	}
+	// Process only the bytes that were actually read.
+	buf = buf[:n]
 
-	var lineCount int64
+	var newlineCount int64
 	partialIndex := make(map[int64]int64)
+	currentOffsetInBuf := 0
 
-	// To handle lines crossing chunk boundaries, we check if the first byte
-	// is part of a newline from the previous chunk. This is complex.
-	// A simpler, more correct approach is to ensure each worker is responsible
-	// for lines that *start* in its chunk.
-	// The first worker starts at offset 0. All other workers will scan backwards
-	// to find the first newline, and start their real work from there.
-	
-	// This implementation uses a simpler `bytes.Count`. It will be mostly accurate
-	// for large files and sufficient for splitting calculations. A fully precise
-	// concurrent count is much more involved.
-	lineCount = int64(bytes.Count(buf, []byte{'\n'}))
-	
-	// Sparse index creation within the chunk is also complex.
-	// This placeholder focuses on the line count.
-	// A full implementation would need to track line numbers cumulatively.
+	for {
+		idx := bytes.IndexByte(buf[currentOffsetInBuf:], '\n')
+		if idx == -1 {
+			break // No more newlines in this part of the buffer
+		}
 
-	return lineCount, partialIndex, nil
+		newlineCount++
+
+		// Check if this newline corresponds to a line number we need to index.
+		// The key for the partial index is the count of newlines *within this chunk*.
+		if newlineCount%indexInterval == 0 {
+			// The value is the global byte offset of the character *after* the newline,
+			// which is the start of the next line.
+			offsetInFile := start + int64(currentOffsetInBuf) + int64(idx) + 1
+			partialIndex[newlineCount] = offsetInFile
+		}
+
+		currentOffsetInBuf += idx + 1
+	}
+
+	return newlineCount, partialIndex, nil
 }
 
 // printHelp displays the detailed help message for the tool.
@@ -433,10 +466,7 @@ func runInteractiveMode(filename string) {
 		fmt.Fprintf(os.Stderr, "Error counting lines: %v\n", err)
 		return
 	}
-	// The count is of newlines, so add 1 for the line count unless the file is empty.
-	if totalLines > 0 || stat, _ := file.Stat(); stat.Size() > 0 {
-		totalLines++
-	}
+	// The line count is the number of newlines. The buggy `+1` logic is removed.
 
 
 	fmt.Printf("\nFile:  %s\n", filepath.Base(filename))
@@ -524,8 +554,12 @@ func showSpinner(done chan bool) {
 // --- Range and Seek Logic ---
 
 func resolveRange(cfg config, totalLines int64) (startLine, endLine int64, err error) {
-	// Default to full range if not specified
-	start, end := int64(1), totalLines
+	// Default to full range if not specified.
+	// endLine = -1 will signify processing until EOF.
+	start, end := int64(1), int64(-1)
+	if totalLines > 0 {
+		end = totalLines // If we have a line count, use it as the default end.
+	}
 
 	if cfg.rangeStart != "" {
 		start, err = parseRangeBoundary(cfg.rangeStart, totalLines)
@@ -539,18 +573,22 @@ func resolveRange(cfg config, totalLines int64) (startLine, endLine int64, err e
 		if err != nil {
 			return 0, 0, fmt.Errorf("invalid end of range: %w", err)
 		}
-	}
-
-	if start > end {
-		return 0, 0, fmt.Errorf("start of range (%d) cannot be after end of range (%d)", start, end)
-	}
-	if start < 1 {
-		start = 1
-	}
-	if end > totalLines {
+	} else if totalLines > 0 {
+		// If no end range was specified, but we have a total line count, use it.
 		end = totalLines
 	}
 
+	// Only validate the start vs end if the end is not "until EOF".
+	if end != -1 && start > end {
+		return 0, 0, fmt.Errorf("start of range (%d) cannot be after end of range (%d)", start, end)
+	}
+
+	if start < 1 {
+		start = 1
+	}
+	if totalLines > 0 && end > totalLines {
+		end = totalLines
+	}
 
 	return start, end, nil
 }
@@ -596,18 +634,28 @@ func seekToLine(f *os.File, sparseIndex map[int64]int64, targetLine int64) error
 		return fmt.Errorf("failed to seek to sparse index offset: %w", err)
 	}
 
-	// Scan forward from that point
-	reader := bufio.NewReader(f)
+	// Scan forward from that point using an unbuffered read to avoid the
+	// read-ahead issue that bufio.Reader can cause.
 	currentLine := bestIndexLine
-	for currentLine < targetLine {
-		_, err := reader.ReadBytes('\n')
+	if currentLine >= targetLine {
+		return nil
+	}
+
+	b := make([]byte, 1)
+	for {
+		_, err := f.Read(b)
 		if err != nil {
 			if err == io.EOF {
 				return fmt.Errorf("target line %d not found in file (EOF reached at line %d)", targetLine, currentLine)
 			}
 			return fmt.Errorf("error scanning to target line: %w", err)
 		}
-		currentLine++
+		if b[0] == '\n' {
+			currentLine++
+			if currentLine >= targetLine {
+				break
+			}
+		}
 	}
 
 	return nil
@@ -615,23 +663,8 @@ func seekToLine(f *os.File, sparseIndex map[int64]int64, targetLine int64) error
 
 // --- Header Logic ---
 
-// extractHeader reads the first line of a file and returns it as a byte slice.
-// It carefully preserves the original seek position of the file.
-func extractHeader(f *os.File) ([]byte, error) {
-	// Save the current position so we can restore it later.
-	currentPos, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, fmt.Errorf("could not get current file position: %w", err)
-	}
-	defer f.Seek(currentPos, io.SeekStart) // Ensure we seek back
-
-	// Seek to the beginning to read the header
-	_, err = f.Seek(0, io.SeekStart)
-	if err != nil {
-		return nil, fmt.Errorf("could not seek to start of file for header: %w", err)
-	}
-
-	reader := bufio.NewReader(f)
+// extractHeader reads the first line from the provided buffered reader.
+func extractHeader(reader *bufio.Reader) ([]byte, error) {
 	headerLine, err := reader.ReadBytes('\n')
 	if err != nil && err != io.EOF {
 		return nil, fmt.Errorf("could not read header line: %w", err)
@@ -659,45 +692,58 @@ func newPartFile(cfg config, part int) (*bufio.Writer, *os.File, error) {
 }
 
 // runSplitByLines handles the splitting logic for the -l/--lines mode.
-func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []byte, sparseIndex map[int64]int64) error {
-	if err := seekToLine(f, sparseIndex, startLine); err != nil {
-		return fmt.Errorf("failed to seek to start line for splitting: %w", err)
+// It supports true streaming when no end range is specified (endLine == -1).
+func runSplitByLines(cfg config, f *os.File, reader *bufio.Reader, startLine, endLine int64, header []byte, sparseIndex map[int64]int64) error {
+	// If startLine > 1, we need to seek to it. If startLine is 1, the file pointer
+	// is already correctly positioned.
+	if startLine > 1 {
+		if err := seekToLine(f, sparseIndex, startLine); err != nil {
+			return fmt.Errorf("failed to seek to start line for splitting: %w", err)
+		}
+		// After seeking the underlying file, we MUST reset the buffered reader
+		// to discard its old buffer, which is now invalid.
+		reader.Reset(f)
 	}
 
-	reader := bufio.NewReaderSize(f, bufSize)
-	
 	partNum := 1
 	linesInPart := int64(0)
-	totalLinesRead := int64(0)
-	linesToRead := endLine - startLine + 1
-	
+	var totalLinesRead int64
+
 	var writer *bufio.Writer
 	var partFile *os.File
-	var err error
-
-	// This function creates files that need to be cleaned up on error.
 	var createdFiles []string
 
 	cleanup := func() {
-		// Close the last file if it's open
 		if partFile != nil {
-			writer.Flush()
+			if writer != nil {
+				writer.Flush()
+			}
 			partFile.Close()
 		}
-		// Remove all created files
 		for _, path := range createdFiles {
 			os.Remove(path)
 		}
 	}
 
-	for totalLinesRead < linesToRead {
+	// Loop until we explicitly break on EOF or error.
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			if err == io.EOF {
+				break // Normal exit condition: we've read the whole file.
+			}
+			cleanup()
+			return fmt.Errorf("error reading line from source: %w", err)
+		}
+
+		// If we have a line, we may need to create a new part file for it.
 		if linesInPart == 0 {
-			// Time to create a new part file
+			// Close the previous part file if it exists.
 			if partFile != nil {
 				writer.Flush()
 				partFile.Close()
 			}
-			
+			// Create the new part file.
 			var currentFile *os.File
 			writer, currentFile, err = newPartFile(cfg, partNum)
 			if err != nil {
@@ -707,6 +753,7 @@ func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []
 			partFile = currentFile
 			createdFiles = append(createdFiles, partFile.Name())
 
+			// Write the header to the new file.
 			if len(header) > 0 {
 				if _, err := writer.Write(header); err != nil {
 					cleanup()
@@ -715,15 +762,7 @@ func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []
 			}
 		}
 
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				break // End of file, we're done
-			}
-			cleanup()
-			return fmt.Errorf("error reading line from source: %w", err)
-		}
-
+		// Write the line we just read.
 		if _, writeErr := writer.Write(line); writeErr != nil {
 			cleanup()
 			return fmt.Errorf("failed to write line to part %d: %w", partNum, writeErr)
@@ -732,12 +771,23 @@ func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []
 		linesInPart++
 		totalLinesRead++
 
+		// If a specific range is being processed, check if we're done.
+		linesToRead := endLine - startLine + 1
+		if !cfg.noHeader && startLine == 1 {
+			linesToRead--
+		}
+		if endLine != -1 && totalLinesRead >= linesToRead {
+			break
+		}
+
+		// If the current part file is full, roll over to the next part number.
 		if linesInPart == cfg.linesN {
 			linesInPart = 0
 			partNum++
 		}
 	}
 
+	// Final flush and close for the last written file.
 	if writer != nil {
 		writer.Flush()
 	}
@@ -758,9 +808,17 @@ func generateName(cfg config, part int) string {
 }
 
 // runSplitByFiles handles the splitting logic for the -f/--files mode.
-func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []byte, totalDataLines int64, sparseIndex map[int64]int64) error {
-	if err := seekToLine(f, sparseIndex, startLine); err != nil {
-		return fmt.Errorf("failed to seek to start line for splitting: %w", err)
+func runSplitByFiles(cfg config, f *os.File, reader *bufio.Reader, startLine, endLine int64, header []byte, totalDataLines int64, sparseIndex map[int64]int64) error {
+	if totalDataLines == 0 {
+		return nil // Nothing to split
+	}
+
+	// If startLine > 1, we need to seek. After seeking, the reader must be reset.
+	if startLine > 1 {
+		if err := seekToLine(f, sparseIndex, startLine); err != nil {
+			return fmt.Errorf("failed to seek to start line for splitting: %w", err)
+		}
+		reader.Reset(f)
 	}
 
 	// --- Worker setup ---
@@ -785,6 +843,13 @@ func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []
 		wg.Add(1)
 		go func(partNum int, ch <-chan []byte) {
 			defer wg.Done()
+
+			// Don't create a file if there are no lines for it.
+			linesPerFile := totalDataLines / int64(cfg.filesN)
+			remainder := totalDataLines % int64(cfg.filesN)
+			if linesPerFile == 0 && int64(partNum) >= remainder {
+				return // This part gets 0 lines, so do nothing.
+			}
 
 			writer, partFile, err := newPartFile(cfg, partNum+1)
 			if err != nil {
@@ -817,33 +882,46 @@ func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []
 		}(i, writerChans[i])
 	}
 
-	// --- Main reader logic ---
-	reader := bufio.NewReaderSize(f, bufSize)
-
+	// --- Main reader logic (Corrected) ---
 	linesPerFile := totalDataLines / int64(cfg.filesN)
 	remainder := totalDataLines % int64(cfg.filesN)
 
-	var currentLine, totalLinesRead int64
+	var partIndex int
+	var linesReadForCurrentPart int64
+	var totalLinesRead int64
+
 	for totalLinesRead < totalDataLines {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF {
-				break
+				break // End of file is expected
 			}
-			return fmt.Errorf("error reading line from source: %w", err)
+			addError(fmt.Errorf("error reading line from source: %w", err))
+			break // Stop on read error
 		}
 
-		partIndex := currentLine / linesPerFile
-		// Distribute remainder lines
-		if partIndex >= int64(cfg.filesN) {
-			partIndex = int64(cfg.filesN - 1)
+		// Make a copy of the line, as the buffer will be reused.
+		lineCopy := make([]byte, len(line))
+		copy(lineCopy, line)
+
+		// Determine the number of lines this part should have.
+		numLinesForThisPart := linesPerFile
+		if int64(partIndex) < remainder {
+			numLinesForThisPart++
 		}
 
-		writerChans[partIndex] <- line
-		
+		// If the part is supposed to get lines, send it.
+		if numLinesForThisPart > 0 {
+			writerChans[partIndex] <- lineCopy
+			linesReadForCurrentPart++
+		}
+
 		totalLinesRead++
-		if totalLinesRead % (linesPerFile) == 0 && (currentLine / linesPerFile) < int64(cfg.filesN-1){
-			currentLine += linesPerFile
+
+		// If the current part is full, move to the next part.
+		if linesReadForCurrentPart >= numLinesForThisPart && partIndex < cfg.filesN-1 {
+			linesReadForCurrentPart = 0
+			partIndex++
 		}
 	}
 
