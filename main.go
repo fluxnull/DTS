@@ -13,10 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const version = "v1.2.3"
+const version = "1.2.3"
 const bufSize = 4 << 20    // 4MB
 const chunkSize = 64 << 20   // 64MB
 const indexInterval = 1000000 // every 1M lines
@@ -35,6 +36,17 @@ type config struct {
 }
 
 func main() {
+	// Manually check for help flags before anything else. This is to ensure that
+	// on Windows, flags like /? are correctly handled and don't trigger
+	// interactive mode.
+	if len(os.Args) == 2 {
+		arg := os.Args[1]
+		if arg == "-h" || arg == "--help" || arg == "/?" {
+			printHelp()
+			os.Exit(0)
+		}
+	}
+
 	// --- Interactive Mode Detection ---
 	// If on Windows and run with a single argument (the file to be split),
 	// enter interactive mode.
@@ -154,7 +166,8 @@ func runSplit(cfg config) error {
 			return fmt.Errorf("could not count lines: %w", err)
 		}
 		// Add 1 to newline count for line count, if file is not empty
-		if lines > 0 || stat, _ := f.Stat(); stat.Size() > 0 {
+		stat, _ := f.Stat()
+		if lines > 0 || stat.Size() > 0 {
 			lines++
 		}
 		totalLines = lines
@@ -434,7 +447,8 @@ func runInteractiveMode(filename string) {
 		return
 	}
 	// The count is of newlines, so add 1 for the line count unless the file is empty.
-	if totalLines > 0 || stat, _ := file.Stat(); stat.Size() > 0 {
+	stat, _ := file.Stat()
+	if totalLines > 0 || stat.Size() > 0 {
 		totalLines++
 	}
 
@@ -822,6 +836,7 @@ func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []
 
 	linesPerFile := totalDataLines / int64(cfg.filesN)
 	remainder := totalDataLines % int64(cfg.filesN)
+	_ = remainder // Acknowledge unused variable to prevent build error.
 
 	var currentLine, totalLinesRead int64
 	for totalLinesRead < totalDataLines {
