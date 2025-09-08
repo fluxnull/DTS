@@ -180,11 +180,13 @@ func runSplit(cfg config) error {
 	}
 	
 	var header []byte
+	effectiveStartLine := startLine
 	if !cfg.noHeader && startLine == 1 {
 		header, err = extractHeader(f)
 		if err != nil {
 			return fmt.Errorf("could not extract header: %w", err)
 		}
+		effectiveStartLine = 2 // If there's a header, we start processing from the next line.
 	}
 
 	// The actual number of lines to be processed
@@ -203,9 +205,9 @@ func runSplit(cfg config) error {
 
 
 	if cfg.filesN > 0 {
-		return runSplitByFiles(cfg, f, startLine, endLine, header, totalDataLines, sparseIndex)
+		return runSplitByFiles(cfg, f, effectiveStartLine, endLine, header, totalDataLines, sparseIndex)
 	} else if cfg.linesN > 0 {
-		return runSplitByLines(cfg, f, startLine, endLine, header, sparseIndex)
+		return runSplitByLines(cfg, f, effectiveStartLine, endLine, header, sparseIndex)
 	}
 
 	return errors.New("no split mode selected (this should not be reached)")
