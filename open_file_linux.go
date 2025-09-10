@@ -4,7 +4,8 @@ package main
 
 import (
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // openFile on Linux uses Fadvise to hint sequential read access.
@@ -16,7 +17,7 @@ func openFile(name string) (*os.File, error) {
 
 	// Use Fadvise to tell the kernel that we are doing sequential reads.
 	// This can improve performance by optimizing file caching.
-	err = syscall.Fadvise(int(file.Fd()), 0, 0, syscall.FADV_SEQUENTIAL)
+	err = unix.Fadvise(int(file.Fd()), 0, 0, unix.FADV_SEQUENTIAL)
 	if err != nil {
 		// Fadvise failure is not critical, we can still proceed.
 		// We can log this error if not in quiet mode.

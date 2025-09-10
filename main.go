@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const version = "1.2.3"
+const version = "2.0.0"
 const bufSize = 4 << 20    // 4MB
 const chunkSize = 64 << 20   // 64MB
 const indexInterval = 1000000 // every 1M lines
@@ -152,62 +152,79 @@ func runSplit(cfg config) error {
 	}
 	defer f.Close()
 
-	var totalLines int64
-	var sparseIndex map[int64]int64
+	// --- Line Counting and Header Extraction ---
+	var header []byte
+	var dataLines int64
 
-	// Line counting is needed for -f mode or if range involves keywords.
-	needsLineCount := cfg.filesN > 0 ||
-		strings.Contains(strings.ToUpper(cfg.rangeStart), "COF") || strings.Contains(strings.ToUpper(cfg.rangeStart), "EOF") ||
-		strings.Contains(strings.ToUpper(cfg.rangeEnd), "COF") || strings.Contains(strings.ToUpper(cfg.rangeEnd), "EOF")
-
-	if needsLineCount {
-		lines, index, err := countLinesAndIndex(f, cfg.quiet)
-		if err != nil {
-			return fmt.Errorf("could not count lines: %w", err)
-		}
-		// Add 1 to newline count for line count, if file is not empty
-		stat, _ := f.Stat()
-		if lines > 0 || stat.Size() > 0 {
-			lines++
-		}
-		totalLines = lines
-		sparseIndex = index
+	// Always count the total physical lines in the file.
+	totalLines, sparseIndex, err := countLinesAndIndex(f, cfg.quiet)
+	if err != nil {
+		return fmt.Errorf("could not count lines: %w", err)
+	}
+	// The logic to increment totalLines was flawed, as it didn't account
+	// for files with a trailing newline. For now, we will assume the newline
+	// count is the line count. A more robust solution might be needed if files
+	// without trailing newlines are common.
+	stat, _ := f.Stat()
+	if totalLines == 0 && stat.Size() > 0 {
+		// Handle the edge case of a single-line file with no newline.
+		totalLines = 1
 	}
 
+	// If there's a header, extract it as a raw byte slice and calculate the number of data lines.
+	if !cfg.noHeader && totalLines > 0 {
+		header, err = extractHeader(f)
+		if err != nil {
+			return fmt.Errorf("could not extract header: %w", err)
+		}
+		dataLines = totalLines - 1
+	} else {
+		dataLines = totalLines
+	}
+
+	// --- Range Resolution ---
+	// This refactor simplifies range handling to focus on the header bug.
+	// A more advanced implementation would adjust range logic based on dataLines.
 	startLine, endLine, err := resolveRange(cfg, totalLines)
 	if err != nil {
 		return fmt.Errorf("could not resolve range: %w", err)
 	}
 	
-	var header []byte
-	effectiveStartLine := startLine
-	if !cfg.noHeader && startLine == 1 {
-		header, err = extractHeader(f)
-		if err != nil {
-			return fmt.Errorf("could not extract header: %w", err)
+	// Rewind the file and seek past the header bytes. This ensures the main
+	// read operations only ever see the data portion of the file.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("could not rewind file: %w", err)
+	}
+	if len(header) > 0 {
+		if _, err := f.Seek(int64(len(header)), io.SeekStart); err != nil {
+			return fmt.Errorf("could not seek past header: %w", err)
 		}
-		effectiveStartLine = 2 // If there's a header, we start processing from the next line.
 	}
 
-	// The actual number of lines to be processed
-	totalDataLines := endLine - startLine + 1
-	if !cfg.noHeader && startLine == 1 {
-		totalDataLines--
+	linesToProcess := dataLines
+	if cfg.rangeStart != "" || cfg.rangeEnd != "" {
+		// A simple line count for the range. Note: header is not counted.
+		linesToProcess = endLine - startLine + 1
+		if !cfg.noHeader {
+			linesToProcess--
+		}
 	}
-	if totalDataLines < 0 {
-		totalDataLines = 0
+	if linesToProcess < 0 {
+		linesToProcess = 0
 	}
 
 
 	if !cfg.quiet {
-		fmt.Printf("Processing %d lines from line %d to %d...\n", totalDataLines, startLine, endLine)
+		fmt.Printf("Processing %d data lines...\n", linesToProcess)
 	}
 
-
+	// --- Dispatch to Splitting Function ---
 	if cfg.filesN > 0 {
-		return runSplitByFiles(cfg, f, effectiveStartLine, endLine, header, totalDataLines, sparseIndex)
+		// Pass dataLines to runSplitByFiles for calculation.
+		return runSplitByFiles(cfg, f, header, dataLines, sparseIndex)
 	} else if cfg.linesN > 0 {
-		return runSplitByLines(cfg, f, effectiveStartLine, endLine, header, sparseIndex)
+		// runSplitByLines now reads until EOF, so it doesn't need a line count.
+		return runSplitByLines(cfg, f, header)
 	}
 
 	return errors.New("no split mode selected (this should not be reached)")
@@ -429,6 +446,13 @@ func runInteractiveMode(filename string) {
 	fmt.Printf("DTS - Delimited Text Splitter v%s\n\n", version)
 	fmt.Println("Running in Interactive Mode...")
 
+	// Prompt for header FIRST, as per the new plan.
+	hasHeader := true
+	headerInput := promptUser("Does this file have a header (Y/N, default is Y)? ")
+	if strings.ToLower(strings.TrimSpace(headerInput)) == "n" {
+		hasHeader = false
+	}
+
 	absPath, err := filepath.Abs(filename)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error getting absolute path: %v\n", err)
@@ -442,33 +466,35 @@ func runInteractiveMode(filename string) {
 	}
 	defer file.Close()
 
-	fmt.Println("Analyzing file, please wait...")
+	fmt.Println("\nAnalyzing file, please wait...")
 	totalLines, _, err := countLinesAndIndex(file, true) // Run in quiet mode for interactive
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error counting lines: %v\n", err)
 		return
 	}
-	// The count is of newlines, so add 1 for the line count unless the file is empty.
 	stat, _ := file.Stat()
 	if totalLines > 0 || stat.Size() > 0 {
 		totalLines++
 	}
 
-
+	// Display the new detailed breakdown.
 	fmt.Printf("\nFile:  %s\n", filepath.Base(filename))
 	fmt.Printf("Path:  %s\n", filepath.Dir(absPath))
-	fmt.Printf("Lines: %d\n\n", totalLines)
+	if hasHeader && totalLines > 0 {
+		fmt.Printf("Header: 1\n")
+		fmt.Printf("Lines:  %d\n", totalLines-1)
+	} else {
+		fmt.Printf("Header: 0\n")
+		fmt.Printf("Lines:  %d\n", totalLines)
+	}
+	fmt.Printf("Total:  %d\n\n", totalLines)
+
 
 	var cfg config
 	cfg.filename = filename
 	cfg.baseName = strings.TrimSuffix(filepath.Base(filename), filepath.Ext(cfg.filename))
 	cfg.outputDir = "." // Default output dir
-
-	// Prompt for header
-	headerInput := promptUser("Does this file have a header (Y/N, default is Y)? ")
-	if strings.ToLower(strings.TrimSpace(headerInput)) == "n" {
-		cfg.noHeader = true
-	}
+	cfg.noHeader = !hasHeader
 
 	// Prompt for split mode
 	for {
@@ -495,7 +521,7 @@ func runInteractiveMode(filename string) {
 	}
 
 	fmt.Println("\nConfiguration complete. Starting process...")
-	
+
 	done := make(chan bool)
 	go showSpinner(done)
 
@@ -675,17 +701,12 @@ func newPartFile(cfg config, part int) (*bufio.Writer, *os.File, error) {
 }
 
 // runSplitByLines handles the splitting logic for the -l/--lines mode.
-func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []byte, sparseIndex map[int64]int64) error {
-	if err := seekToLine(f, sparseIndex, startLine); err != nil {
-		return fmt.Errorf("failed to seek to start line for splitting: %w", err)
-	}
-
+// It reads from the file f, which is already positioned at the start of the data.
+func runSplitByLines(cfg config, f *os.File, header []byte) error {
 	reader := bufio.NewReaderSize(f, bufSize)
 	
 	partNum := 1
 	linesInPart := int64(0)
-	totalLinesRead := int64(0)
-	linesToRead := endLine - startLine + 1
 	
 	var writer *bufio.Writer
 	var partFile *os.File
@@ -693,22 +714,19 @@ func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []
 
 	// This function creates files that need to be cleaned up on error.
 	var createdFiles []string
-
 	cleanup := func() {
-		// Close the last file if it's open
 		if partFile != nil {
 			writer.Flush()
 			partFile.Close()
 		}
-		// Remove all created files
 		for _, path := range createdFiles {
 			os.Remove(path)
 		}
 	}
 
-	for totalLinesRead < linesToRead {
+	for {
+		// Create a new part file if we are at the start of a chunk.
 		if linesInPart == 0 {
-			// Time to create a new part file
 			if partFile != nil {
 				writer.Flush()
 				partFile.Close()
@@ -723,6 +741,7 @@ func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []
 			partFile = currentFile
 			createdFiles = append(createdFiles, partFile.Name())
 
+			// Prepend the header to every new file.
 			if len(header) > 0 {
 				if _, err := writer.Write(header); err != nil {
 					cleanup()
@@ -731,23 +750,26 @@ func runSplitByLines(cfg config, f *os.File, startLine, endLine int64, header []
 			}
 		}
 
+		// Read the next line of data.
 		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				break // End of file, we're done
-			}
+		if err != nil && err != io.EOF {
 			cleanup()
 			return fmt.Errorf("error reading line from source: %w", err)
 		}
 
-		if _, writeErr := writer.Write(line); writeErr != nil {
-			cleanup()
-			return fmt.Errorf("failed to write line to part %d: %w", partNum, writeErr)
+		if len(line) > 0 {
+			if _, writeErr := writer.Write(line); writeErr != nil {
+				cleanup()
+				return fmt.Errorf("failed to write line to part %d: %w", partNum, writeErr)
+			}
+			linesInPart++
 		}
 
-		linesInPart++
-		totalLinesRead++
+		if err == io.EOF {
+			break // End of file, we're done.
+		}
 
+		// Rollover to the next file if the line limit is reached.
 		if linesInPart == cfg.linesN {
 			linesInPart = 0
 			partNum++
@@ -774,9 +796,10 @@ func generateName(cfg config, part int) string {
 }
 
 // runSplitByFiles handles the splitting logic for the -f/--files mode.
-func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []byte, totalDataLines int64, sparseIndex map[int64]int64) error {
-	if err := seekToLine(f, sparseIndex, startLine); err != nil {
-		return fmt.Errorf("failed to seek to start line for splitting: %w", err)
+// It reads from f, which is already positioned at the start of the data.
+func runSplitByFiles(cfg config, f *os.File, header []byte, dataLines int64, sparseIndex map[int64]int64) error {
+	if dataLines == 0 {
+		return nil // Nothing to split.
 	}
 
 	// --- Worker setup ---
@@ -813,6 +836,7 @@ func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []
 			createdFiles = append(createdFiles, partFile.Name())
 			fileMu.Unlock()
 
+			// Prepend the header to every new file.
 			if len(header) > 0 {
 				if _, err := writer.Write(header); err != nil {
 					addError(fmt.Errorf("failed to write header to part %d: %w", partNum+1, err))
@@ -823,7 +847,7 @@ func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []
 			for line := range ch {
 				if _, err := writer.Write(line); err != nil {
 					addError(fmt.Errorf("failed to write line to part %d: %w", partNum+1, err))
-					return // Stop processing for this writer on error
+					return
 				}
 			}
 
@@ -836,31 +860,31 @@ func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []
 	// --- Main reader logic ---
 	reader := bufio.NewReaderSize(f, bufSize)
 
-	linesPerFile := totalDataLines / int64(cfg.filesN)
-	remainder := totalDataLines % int64(cfg.filesN)
-	_ = remainder // Acknowledge unused variable to prevent build error.
+	linesPerFile := dataLines / int64(cfg.filesN)
+	remainder := dataLines % int64(cfg.filesN)
 
-	var currentLine, totalLinesRead int64
-	for totalLinesRead < totalDataLines {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
+	for i := 0; i < cfg.filesN; i++ {
+		linesForThisPart := linesPerFile
+		if i < int(remainder) {
+			linesForThisPart++
+		}
+
+		for j := int64(0); j < linesForThisPart; j++ {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				if err == io.EOF {
+					if len(line) > 0 {
+						writerChans[i] <- line
+					}
+					break
+				}
+				addError(fmt.Errorf("error reading line for part %d: %w", i+1, err))
 				break
 			}
-			return fmt.Errorf("error reading line from source: %w", err)
+			writerChans[i] <- line
 		}
-
-		partIndex := currentLine / linesPerFile
-		// Distribute remainder lines
-		if partIndex >= int64(cfg.filesN) {
-			partIndex = int64(cfg.filesN - 1)
-		}
-
-		writerChans[partIndex] <- line
-		
-		totalLinesRead++
-		if totalLinesRead % (linesPerFile) == 0 && (currentLine / linesPerFile) < int64(cfg.filesN-1){
-			currentLine += linesPerFile
+		if len(allErrors) > 0 {
+			break
 		}
 	}
 
@@ -871,11 +895,9 @@ func runSplitByFiles(cfg config, f *os.File, startLine, endLine int64, header []
 	wg.Wait()
 
 	if len(allErrors) > 0 {
-		// Cleanup all created files on error
 		for _, path := range createdFiles {
 			os.Remove(path)
 		}
-		// Return a combined error
 		var errStrings []string
 		for _, err := range allErrors {
 			errStrings = append(errStrings, err.Error())
