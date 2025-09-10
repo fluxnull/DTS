@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-const version = "2.0.0"
+const version = "2.0.1"
 const bufSize = 4 << 20    // 4MB
 const chunkSize = 64 << 20   // 64MB
 const indexInterval = 1000000 // every 1M lines
@@ -498,8 +498,15 @@ func runInteractiveMode(filename string) {
 
 	// Prompt for split mode
 	for {
-		modeInput := promptUser("Select a split mode (1: By file count, 2: By line count): ")
-		if strings.TrimSpace(modeInput) == "1" {
+		modeInput := promptUser("Select a split mode (1: By file count, 2: By line count, default is 1): ")
+		trimmedInput := strings.TrimSpace(modeInput)
+
+		// Default to "1" if the input is empty
+		if trimmedInput == "" {
+			trimmedInput = "1"
+		}
+
+		if trimmedInput == "1" {
 			countStr := promptUser("Enter number of files: ")
 			count, err := strconv.Atoi(strings.TrimSpace(countStr))
 			if err == nil && count > 0 {
@@ -507,7 +514,7 @@ func runInteractiveMode(filename string) {
 				break
 			}
 			fmt.Println("Invalid number. Please try again.")
-		} else if strings.TrimSpace(modeInput) == "2" {
+		} else if trimmedInput == "2" {
 			countStr := promptUser("Enter max lines per file: ")
 			count, err := parseLineCount(countStr)
 			if err == nil && count > 0 {

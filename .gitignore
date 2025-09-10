@@ -1,0 +1,6 @@
+temp_data/
+test_output/
+*.csv
+*.exe
+*.syso
+*.rc
